@@ -3,6 +3,7 @@ from flask import Flask, request, jsonify, render_template_string, session
 from database import init_db, save_analysis, get_last_analysis, get_all_analyses
 from auth import register, login
 from claude_api import run_full_analysis
+from agents import run_agent_pipeline
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev_secret_change_in_prod")
@@ -94,6 +95,24 @@ HTML = """
   th{text-align:left;padding:10px 12px;background:var(--surface);border-bottom:1px solid var(--border);color:var(--muted);letter-spacing:.08em;text-transform:uppercase;font-weight:400}
   td{padding:10px 12px;border-bottom:1px solid rgba(30,30,46,.5)}
   .win{color:var(--accent)}.loss{color:var(--accent2)}
+  .agent-section{margin-top:48px}
+  .agent-step{background:var(--surface);border:1px solid var(--border);margin-bottom:12px;overflow:hidden}
+  .agent-step-header{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid transparent;font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;cursor:pointer}
+  .agent-step-header.has-content{border-bottom-color:var(--border)}
+  .agent-step-num{width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0}
+  .agent-step-num.research{background:rgba(0,255,136,.12);color:var(--accent);border:1px solid rgba(0,255,136,.3)}
+  .agent-step-num.backtest{background:rgba(100,160,255,.12);color:#64a0ff;border:1px solid rgba(100,160,255,.3)}
+  .agent-step-num.eval{background:rgba(255,200,0,.12);color:#ffc800;border:1px solid rgba(255,200,0,.3)}
+  .agent-step-title{flex:1;color:var(--text)}
+  .agent-step-status{font-size:9px;letter-spacing:.08em;color:var(--muted)}
+  .agent-step-status.done{color:var(--accent)}
+  .agent-step-body{padding:20px 24px;font-family:var(--mono);font-size:12px;line-height:1.8;white-space:pre-wrap;color:var(--text);display:none;max-height:440px;overflow-y:auto;border-top:1px solid var(--border)}
+  .agent-step-body.show{display:block}
+  .agent-btn{display:inline-flex;align-items:center;gap:10px;margin-top:20px;padding:14px 32px;background:transparent;color:var(--accent);font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;border:1px solid var(--accent);cursor:pointer;transition:all .15s}
+  .agent-btn:hover:not(:disabled){background:var(--accent);color:#000}
+  .agent-btn:disabled{opacity:.4;cursor:not-allowed}
+  .agent-loading{display:none;align-items:center;gap:10px;margin-top:16px;font-family:var(--mono);font-size:11px;color:var(--accent);letter-spacing:.08em}
+  .agent-loading.show{display:flex}
 </style>
 </head>
 <body>
@@ -153,6 +172,45 @@ HTML = """
     <hr class="divider">
     <div class="label">歷史盈虧追蹤</div>
     <div class="history-chart" id="historyChart"></div>
+  </div>
+
+  <div class="agent-section">
+    <hr class="divider">
+    <div class="label">AI 策略研究員 — 三Agent協作</div>
+    <p class="hint">✦ Agent 1 搜尋獲利指標 → Agent 2 程式化回測 → Agent 3 評估是否值得交易</p>
+    <button class="agent-btn" id="agentBtn" onclick="runAgentPipeline()">啟動三Agent分析 →</button>
+    <div class="agent-loading" id="agentLoading">
+      <div class="spinner"></div>
+      <span id="agentStatus">Agent 正在執行，請稍候（約需 1-3 分鐘）...</span>
+    </div>
+    <div class="error-box" id="agentErrorBox"></div>
+
+    <div id="agentResults" style="display:none;margin-top:24px">
+      <div class="agent-step" onclick="toggleAgent('body1',this)">
+        <div class="agent-step-header" id="header1">
+          <div class="agent-step-num research">1</div>
+          <div class="agent-step-title">研究Agent — 搜尋網路獲利指標</div>
+          <div class="agent-step-status" id="status1">等待中</div>
+        </div>
+        <div class="agent-step-body" id="body1"></div>
+      </div>
+      <div class="agent-step" onclick="toggleAgent('body2',this)">
+        <div class="agent-step-header" id="header2">
+          <div class="agent-step-num backtest">2</div>
+          <div class="agent-step-title">回測Agent — 程式化回測指標</div>
+          <div class="agent-step-status" id="status2">等待中</div>
+        </div>
+        <div class="agent-step-body" id="body2"></div>
+      </div>
+      <div class="agent-step" onclick="toggleAgent('body3',this)">
+        <div class="agent-step-header" id="header3">
+          <div class="agent-step-num eval">3</div>
+          <div class="agent-step-title">評估Agent — 判斷策略可行性</div>
+          <div class="agent-step-status" id="status3">等待中</div>
+        </div>
+        <div class="agent-step-body" id="body3"></div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -298,6 +356,77 @@ async function loadHistory() {
   } catch(e) {}
 }
 
+function toggleAgent(bodyId, stepEl) {
+  const body = document.getElementById(bodyId);
+  if (!body.classList.contains('show') && !body.textContent.trim()) return;
+  const header = stepEl.querySelector('.agent-step-header');
+  body.classList.toggle('show');
+  header.classList.toggle('has-content', body.classList.contains('show'));
+}
+
+async function runAgentPipeline() {
+  const btn = document.getElementById('agentBtn');
+  const loading = document.getElementById('agentLoading');
+  const results = document.getElementById('agentResults');
+  const errorBox = document.getElementById('agentErrorBox');
+
+  btn.disabled = true;
+  loading.classList.add('show');
+  errorBox.classList.remove('show');
+  results.style.display = 'none';
+
+  ['1','2','3'].forEach(i => {
+    document.getElementById('status'+i).textContent = '等待中';
+    document.getElementById('status'+i).className = 'agent-step-status';
+    document.getElementById('body'+i).classList.remove('show');
+    document.getElementById('body'+i).textContent = '';
+    document.getElementById('header'+i).classList.remove('has-content');
+  });
+
+  try {
+    const res = await fetch('/api/agent-pipeline', {method:'POST',
+      headers:{'Content-Type':'application/json'}});
+    const data = await res.json();
+
+    if (data.error) {
+      errorBox.textContent = '⚠ ' + data.error;
+      errorBox.classList.add('show');
+      return;
+    }
+
+    results.style.display = 'block';
+
+    if (data.research) {
+      document.getElementById('status1').textContent = '✅ 完成';
+      document.getElementById('status1').className = 'agent-step-status done';
+      document.getElementById('body1').textContent = data.research;
+      document.getElementById('body1').classList.add('show');
+      document.getElementById('header1').classList.add('has-content');
+    }
+    if (data.backtest) {
+      document.getElementById('status2').textContent = '✅ 完成';
+      document.getElementById('status2').className = 'agent-step-status done';
+      document.getElementById('body2').textContent = data.backtest;
+      document.getElementById('body2').classList.add('show');
+      document.getElementById('header2').classList.add('has-content');
+    }
+    if (data.evaluation) {
+      document.getElementById('status3').textContent = '✅ 完成';
+      document.getElementById('status3').className = 'agent-step-status done';
+      document.getElementById('body3').textContent = data.evaluation;
+      document.getElementById('body3').classList.add('show');
+      document.getElementById('header3').classList.add('has-content');
+      document.getElementById('agentResults').scrollIntoView({behavior:'smooth',block:'start'});
+    }
+  } catch(e) {
+    errorBox.textContent = '⚠ 連線失敗：' + e.message;
+    errorBox.classList.add('show');
+  } finally {
+    btn.disabled = false;
+    loading.classList.remove('show');
+  }
+}
+
 init();
 </script>
 </body>
@@ -372,6 +501,19 @@ def history_route():
     if not user_id:
         return jsonify({"analyses": []})
     return jsonify({"analyses": get_all_analyses(user_id)})
+
+@app.route("/api/agent-pipeline", methods=["POST"])
+def agent_pipeline_route():
+    """
+    執行三個AI Agent的完整分析流程：
+    Agent 1 搜尋指標 → Agent 2 回測 → Agent 3 評估
+    """
+    try:
+        result = run_agent_pipeline()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
